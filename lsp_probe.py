@@ -208,6 +208,7 @@ def main() -> int:
     arguments = parser.parse_args()
 
     record_path = Path(arguments.record) if arguments.record else Path(tempfile.gettempdir()) / "lsp-probe.json"
+    record_path.parent.mkdir(parents=True, exist_ok=True)
     server = Server(arguments.server, record_path.with_suffix(".stderr.log"))
     server.folders = [Path(folder).resolve() for folder in arguments.folder]
     initialize = server.request("initialize", {
