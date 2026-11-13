@@ -34,4 +34,4 @@ python lsp_probe.py --server "$SERVER" --folder fixtures/android-composite/app -
 grep "Unable to resolve all compiler arguments" runs/298.server.log
 ```
 
-On a fresh clone, with nothing built, the server log holds the error once for each variant of each Android module.
+On a fresh clone, with nothing built, v263.7084.0's server log holds the error once for each variant of each Android module; v271.2085.0's holds none.
