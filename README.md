@@ -22,10 +22,10 @@ The first run answers the definition with `Greeter.kt`; the second, where `secon
 ## Kotlin/kotlin-lsp#297 — an Android library from an included build resolves nothing
 
 ```sh
-python lsp_probe.py --server "$SERVER" --folder fixtures/android-composite/app --definition fixtures/android-composite/app/src/main/kotlin/com/example/app/App.kt:5:25 --definition fixtures/android-composite/app/src/main/kotlin/com/example/app/App.kt:5:43 --hover fixtures/android-composite/app/src/main/kotlin/com/example/app/App.kt:5:25 --hover fixtures/android-composite/app/src/main/kotlin/com/example/app/App.kt:5:43 --record runs/297.json
+python check_297.py --server "$SERVER" --gradle "$GRADLE"
 ```
 
-`Local` (5:43), from the app's own `:local`, resolves; `Library` (5:25), from the included build, does not.
+`check_297.py`, which needs Python 3.11 or later, imports `fixtures/android-composite/app` with nothing built and asks go-to-definition and hover on `Library` (5:25), from the included build, and on `Local` (5:43), from the app's own `:local`; asks the same of `Library` in `fixtures/composite/app`, whose included build is Kotlin/JVM; and with `--gradle`, a Gradle 8.14 command, runs `compileDebugKotlin` in the Android app and asks its two again. It prints each answer and a summary, and exits 1 while `Library` does not resolve and `Local` does, 0 once `Library` resolves too, and 2 when a step fails.
 
 ## Kotlin/kotlin-lsp#298 — an Android module that has not been built gets no Java compiler arguments
 

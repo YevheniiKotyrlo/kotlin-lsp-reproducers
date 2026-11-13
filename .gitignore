@@ -4,3 +4,4 @@
 build/
 runs/
 local.properties
+__pycache__/

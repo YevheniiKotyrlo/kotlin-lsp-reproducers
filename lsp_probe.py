@@ -37,13 +37,17 @@ class Server:
         self.next_id = 0
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         self.stderr = stderr_path.open("wb")
-        self.process = subprocess.Popen(
-            [executable, "--stdio"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self.stderr,
-            creationflags=creation_flags,
-        )
+        try:
+            self.process = subprocess.Popen(
+                [executable, "--stdio"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self.stderr,
+                creationflags=creation_flags,
+            )
+        except OSError:
+            self.stderr.close()
+            raise
         threading.Thread(target=self._read, daemon=True).start()
 
     def elapsed(self) -> float:
@@ -141,11 +145,11 @@ class Server:
         return "begun" if begun else "none-within-grace"
 
     def stop(self) -> None:
-        self.request("shutdown", {}, 60)
-        self.notify("exit", {})
         try:
+            self.request("shutdown", {}, 60)
+            self.notify("exit", {})
             self.process.wait(timeout=60)
-        except subprocess.TimeoutExpired:
+        except (OSError, subprocess.TimeoutExpired):
             self.process.kill()
         self.stderr.close()
 
@@ -195,6 +199,65 @@ def read_server_log(started_wall: float, copy_to: Path) -> dict:
     return {"path": None}
 
 
+def run_probe(executable: str, folders: list[str], added_folders: list[str], definitions: list[str],
+              hovers: list[str], import_deadline: float, grace: float, record_path: Path) -> dict:
+    """Runs one server through the steps the module's usage names, keeps its record, stderr and log beside
+    `record_path`, and returns the report."""
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    server = Server(executable, record_path.with_suffix(".stderr.log"))
+    try:
+        server.folders = [Path(folder).resolve() for folder in folders]
+        initialize = server.request("initialize", {
+            "processId": os.getpid(),
+            "rootUri": server.folders[0].as_uri(),
+            "workspaceFolders": [{"uri": folder.as_uri(), "name": folder.name} for folder in server.folders],
+            "capabilities": {
+                "workspace": {"workspaceFolders": True, "configuration": True},
+                "window": {"workDoneProgress": True},
+                "textDocument": {"hover": {"contentFormat": ["markdown", "plaintext"]}, "definition": {},
+                                 "publishDiagnostics": {}},
+            },
+        }, 300)
+        capabilities = (initialize.get("message") or {}).get("result", {}).get("capabilities", {})
+        server.notify("initialized", {})
+        report: dict = {"workspace_capability": capabilities.get("workspace"),
+                        "initial_folders": [str(folder) for folder in server.folders]}
+        report["initial_import"] = server.wait_for_progress_to_settle(0, import_deadline)
+
+        if added_folders:
+            added = [Path(folder).resolve() for folder in added_folders]
+            begun_before = server.progress_begun
+            server.folders.extend(added)
+            server.notify("workspace/didChangeWorkspaceFolders", {"event": {
+                "added": [{"uri": folder.as_uri(), "name": folder.name} for folder in added], "removed": []}})
+            report["added_folders"] = [str(folder) for folder in added]
+            report["added_import"] = server.wait_for_progress_to_begin(begun_before, grace)
+            if report["added_import"] == "begun":
+                report["added_import"] = server.wait_for_progress_to_settle(begun_before, import_deadline)
+
+        opened: set[Path] = set()
+        report["queries"] = []
+        for kind, positions in (("definition", definitions), ("hover", hovers)):
+            for position in positions:
+                file, line, character = parse_position(position)
+                if file not in opened:
+                    server.notify("textDocument/didOpen", {"textDocument": {
+                        "uri": file.as_uri(), "languageId": "kotlin", "version": 1,
+                        "text": file.read_text(encoding="utf-8")}})
+                    opened.add(file)
+                answer = server.request(f"textDocument/{kind}", {
+                    "textDocument": {"uri": file.as_uri()}, "position": {"line": line, "character": character}}, 120)
+                report["queries"].append({"kind": kind, "at": f"{file.name}:{line}:{character}",
+                                          "answer": summarize_answer(kind, answer)})
+
+        report["server_log"] = read_server_log(server.started_wall, record_path.with_suffix(".server.log"))
+    finally:
+        server.stop()
+    report["progress"] = [event for event in server.events if event["kind"] == "progress"]
+    record_path.write_text(json.dumps({"report": report, "events": server.events}, indent=1), encoding="utf-8")
+    return report
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", required=True)
@@ -208,56 +271,8 @@ def main() -> int:
     arguments = parser.parse_args()
 
     record_path = Path(arguments.record) if arguments.record else Path(tempfile.gettempdir()) / "lsp-probe.json"
-    record_path.parent.mkdir(parents=True, exist_ok=True)
-    server = Server(arguments.server, record_path.with_suffix(".stderr.log"))
-    server.folders = [Path(folder).resolve() for folder in arguments.folder]
-    initialize = server.request("initialize", {
-        "processId": os.getpid(),
-        "rootUri": server.folders[0].as_uri(),
-        "workspaceFolders": [{"uri": folder.as_uri(), "name": folder.name} for folder in server.folders],
-        "capabilities": {
-            "workspace": {"workspaceFolders": True, "configuration": True},
-            "window": {"workDoneProgress": True},
-            "textDocument": {"hover": {"contentFormat": ["markdown", "plaintext"]}, "definition": {},
-                             "publishDiagnostics": {}},
-        },
-    }, 300)
-    capabilities = (initialize.get("message") or {}).get("result", {}).get("capabilities", {})
-    server.notify("initialized", {})
-    report: dict = {"workspace_capability": capabilities.get("workspace"),
-                    "initial_folders": [str(folder) for folder in server.folders]}
-    report["initial_import"] = server.wait_for_progress_to_settle(0, arguments.import_deadline)
-
-    if arguments.add:
-        added = [Path(folder).resolve() for folder in arguments.add]
-        begun_before = server.progress_begun
-        server.folders.extend(added)
-        server.notify("workspace/didChangeWorkspaceFolders", {"event": {
-            "added": [{"uri": folder.as_uri(), "name": folder.name} for folder in added], "removed": []}})
-        report["added_folders"] = [str(folder) for folder in added]
-        report["added_import"] = server.wait_for_progress_to_begin(begun_before, arguments.grace)
-        if report["added_import"] == "begun":
-            report["added_import"] = server.wait_for_progress_to_settle(begun_before, arguments.import_deadline)
-
-    opened: set[Path] = set()
-    report["queries"] = []
-    for kind, positions in (("definition", arguments.definition), ("hover", arguments.hover)):
-        for position in positions:
-            file, line, character = parse_position(position)
-            if file not in opened:
-                server.notify("textDocument/didOpen", {"textDocument": {
-                    "uri": file.as_uri(), "languageId": "kotlin", "version": 1,
-                    "text": file.read_text(encoding="utf-8")}})
-                opened.add(file)
-            answer = server.request(f"textDocument/{kind}", {
-                "textDocument": {"uri": file.as_uri()}, "position": {"line": line, "character": character}}, 120)
-            report["queries"].append({"kind": kind, "at": f"{file.name}:{line}:{character}",
-                                      "answer": summarize_answer(kind, answer)})
-
-    report["server_log"] = read_server_log(server.started_wall, record_path.with_suffix(".server.log"))
-    server.stop()
-    report["progress"] = [event for event in server.events if event["kind"] == "progress"]
-    record_path.write_text(json.dumps({"report": report, "events": server.events}, indent=1), encoding="utf-8")
+    report = run_probe(arguments.server, arguments.folder, arguments.add, arguments.definition, arguments.hover,
+                       arguments.import_deadline, arguments.grace, record_path)
     print(json.dumps({key: value for key, value in report.items() if key != "progress"}, indent=1))
     return 0
 
